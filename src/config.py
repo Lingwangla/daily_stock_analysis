@@ -138,7 +138,7 @@ class Config:
     
     # === 日志配置 ===
     log_dir: str = "./logs"  # 日志文件目录
-    log_level: str = "INFO"  # 日志级别
+    log_level: str = "DEBUG"  # 日志级别 INFO
     
     # === 系统配置 ===
     max_workers: int = 3  # 低并发防封禁
