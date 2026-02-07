@@ -1658,6 +1658,7 @@ class NotificationService:
         def _post_payload(payload: Dict[str, Any]) -> bool:
             logger.debug(f"飞书请求 URL: {self._feishu_url}")
             logger.debug(f"飞书请求 payload 长度: {len(content)} 字符")
+            logger.debug(f"飞书内容 content: {content}")
 
             response = requests.post(
                 self._feishu_url,
