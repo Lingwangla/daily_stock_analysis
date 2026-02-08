@@ -716,12 +716,25 @@ class AkshareFetcher(BaseFetcher):
         elif _is_hk_code(stock_code):
             return self._get_hk_realtime_quote(stock_code)
         elif _is_etf_code(stock_code):
+            # ETF 属于场内交易品种，新浪/腾讯源可直接按股票接口查询
+            if source == "sina":
+                return self._get_stock_realtime_quote_sina(stock_code)
+            elif source == "tencent":
+                return self._get_stock_realtime_quote_tencent(stock_code)
             return self._get_etf_realtime_quote(stock_code)
         else:
             # 普通 A 股：根据 source 选择数据源
             if source == "sina":
+                # 优先尝试新浪基金接口；若为空则回退到股票接口
+                fund_quote = self._get_fund_realtime_quote_sina(stock_code)
+                if fund_quote and fund_quote.has_basic_data():
+                    return fund_quote
                 return self._get_stock_realtime_quote_sina(stock_code)
             elif source == "tencent":
+                # 优先尝试腾讯基金接口；若为空则回退到股票接口
+                fund_quote = self._get_fund_realtime_quote_tencent(stock_code)
+                if fund_quote and fund_quote.has_basic_data():
+                    return fund_quote
                 return self._get_stock_realtime_quote_tencent(stock_code)
             else:
                 return self._get_stock_realtime_quote_em(stock_code)
@@ -925,6 +938,67 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(source_key, str(e))
             return None
     
+    def _get_fund_realtime_quote_sina(self, fund_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """
+        获取开放式基金实时净值数据（新浪）
+        
+        接口格式：http://hq.sinajs.cn/list=f_110022
+        返回字段包含：基金名称、单位净值、累计净值、涨跌幅等
+        """
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "sina_fund"
+        try:
+            import requests
+            symbol = f"f_{fund_code}"
+            url = f"http://hq.sinajs.cn/list={symbol}"
+            headers = {
+                'Referer': 'http://finance.sina.com.cn',
+                'User-Agent': random.choice(USER_AGENTS)
+            }
+            self._enforce_rate_limit()
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.encoding = 'gbk'
+            if resp.status_code != 200:
+                circuit_breaker.record_failure(source_key, f"HTTP {resp.status_code}")
+                return None
+            content = resp.text.strip()
+            if '=""' in content or not content:
+                return None
+            s_idx = content.find('"')
+            e_idx = content.rfind('"')
+            if s_idx == -1 or e_idx == -1:
+                circuit_breaker.record_failure(source_key, "数据格式异常")
+                return None
+            fields = content[s_idx+1:e_idx].split(',')
+            if len(fields) < 4:
+                return None
+            # 典型字段：0名称 1单位净值 2累计净值 3涨跌幅(%) ... 日期/时间等
+            name = fields[0] if fields[0] else ""
+            price = safe_float(fields[1])
+            # 寻找带 '%' 的字段作为涨跌幅
+            change_pct = None
+            for f in fields:
+                if isinstance(f, str) and '%' in f:
+                    try:
+                        change_pct = float(f.replace('%', '').strip())
+                        break
+                    except Exception:
+                        continue
+            quote = UnifiedRealtimeQuote(
+                code=fund_code,
+                name=name,
+                source=RealtimeSource.SINA,
+                price=price,
+                change_pct=change_pct,
+            )
+            circuit_breaker.record_success(source_key)
+            logger.info(f"[基金实时-新浪] {fund_code} {name}: 净值={quote.price}, 涨跌幅={quote.change_pct}%")
+            return quote if quote.has_basic_data() else None
+        except Exception as e:
+            logger.warning(f"[API错误] 获取基金 {fund_code} 实时净值(新浪)失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return None
+    
     def _get_stock_realtime_quote_tencent(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取普通 A 股实时行情数据（腾讯财经数据源）
@@ -1019,6 +1093,73 @@ class AkshareFetcher(BaseFetcher):
             
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 实时行情(腾讯)失败: {e}")
+            circuit_breaker.record_failure(source_key, str(e))
+            return None
+    
+    def _get_fund_realtime_quote_tencent(self, fund_code: str) -> Optional[UnifiedRealtimeQuote]:
+        """
+        获取开放式基金实时净值数据（腾讯）
+        
+        接口格式：http://qt.gtimg.cn/q=jj110022
+        返回字段以 ~ 分隔，包含名称、净值、涨跌幅等
+        """
+        circuit_breaker = get_realtime_circuit_breaker()
+        source_key = "tencent_fund"
+        try:
+            import requests
+            symbol = f"jj{fund_code}"
+            url = f"http://qt.gtimg.cn/q={symbol}"
+            headers = {
+                'Referer': 'http://finance.qq.com',
+                'User-Agent': random.choice(USER_AGENTS)
+            }
+            self._enforce_rate_limit()
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.encoding = 'gbk'
+            if resp.status_code != 200:
+                circuit_breaker.record_failure(source_key, f"HTTP {resp.status_code}")
+                return None
+            content = resp.text.strip()
+            if '=""' in content or not content:
+                return None
+            s_idx = content.find('"')
+            e_idx = content.rfind('"')
+            if s_idx == -1 or e_idx == -1:
+                circuit_breaker.record_failure(source_key, "数据格式异常")
+                return None
+            fields = content[s_idx+1:e_idx].split('~')
+            if len(fields) < 5:
+                return None
+            # 尝试解析：优先取第一个可解析的数值作为净值
+            name = fields[1] if len(fields) > 1 else ""
+            price = None
+            for f in fields:
+                val = safe_float(f)
+                if val is not None and val > 0:
+                    price = val
+                    break
+            change_pct = None
+            for f in fields:
+                if isinstance(f, str) and '%' in f:
+                    try:
+                        change_pct = float(f.replace('%', '').strip())
+                        break
+                    except Exception:
+                        continue
+            quote = UnifiedRealtimeQuote(
+                code=fund_code,
+                name=name,
+                source=RealtimeSource.TENCENT,
+                price=price,
+                change_pct=change_pct,
+            )
+            if quote.has_basic_data():
+                circuit_breaker.record_success(source_key)
+                logger.info(f"[基金实时-腾讯] {fund_code} {name}: 净值={quote.price}, 涨跌幅={quote.change_pct}%")
+                return quote
+            return None
+        except Exception as e:
+            logger.warning(f"[API错误] 获取基金 {fund_code} 实时净值(腾讯)失败: {e}")
             circuit_breaker.record_failure(source_key, str(e))
             return None
     
